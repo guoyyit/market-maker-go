@@ -115,7 +115,7 @@ func TestStaleAndDuplicateTicksDoNotOverwrite(t *testing.T) {
 	}
 }
 
-func TestDuplicateAndStaleTradesDoNotDoubleCount(t *testing.T) {
+func TestDuplicateTradesDoNotDoubleCount(t *testing.T) {
 	h := newHarness(t, testConfig())
 	defer h.stop()
 	base := time.Unix(1_000_000, 0)
@@ -144,23 +144,25 @@ func TestDuplicateAndStaleTradesDoNotDoubleCount(t *testing.T) {
 		t.Fatalf("duplicate trade: skipped=%v pos=%d", obs.Skipped, obs.Position)
 	}
 
-	// 新 ID 但序号回退（迟到）：也不得入账。
+	// 新 ID 但序号回退（迟到）：新语义下必须生效一次，
+	// 不再因序号旧而被拒绝（只有完全相同的重复成交才被忽略）。
 	stale := trade
 	stale.ID = "F-OLD"
 	stale.Seq = 0
 	obs = h.send(Event{Trade: &TradeEvent{Trade: stale}})
-	if !obs.Skipped || obs.Position != 10 {
-		t.Fatalf("stale-seq trade: skipped=%v pos=%d", obs.Skipped, obs.Position)
+	if obs.Skipped || obs.Position != 20 {
+		t.Fatalf("new-id stale-seq trade must apply once: skipped=%v pos=%d",
+			obs.Skipped, obs.Position)
 	}
 
-	if h.eng.ledgerSnapshotCount() != 1 {
-		t.Fatalf("applied trade count = %d, want 1", h.eng.ledgerSnapshotCount())
+	if h.eng.ledgerSnapshotCount() != 2 {
+		t.Fatalf("applied trade count = %d, want 2", h.eng.ledgerSnapshotCount())
 	}
 
-	// 成交档位代号轮换：该档新挂单必须使用 GEN=1 的新 ID，
+	// 成交档位代号轮换：两笔成交各使买档代号加 1，最终在挂为 GEN=2，
 	// 旧 GEN=0 已成交，不允许重复挂。
 	found := false
-	newID := pricing.ClientOrderID(testSymbol, types.SideBuy, 0, 1)
+	newID := pricing.ClientOrderID(testSymbol, types.SideBuy, 0, 2)
 	for _, quote := range obs.OpenQuotes {
 		if quote.ClientOrderID == newID {
 			found = true

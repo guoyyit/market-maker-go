@@ -102,16 +102,13 @@ func (e *Engine) handleTick(ctx context.Context, ev *TickEvent) (bool, error) {
 }
 
 // handleTrade 处理一笔成交回报：
-// 重复 ID / 旧序号过滤 -> 账本去重入账 -> 档位代号轮换 ->
-// 重新生成意图并对账 -> 持久化。
+// 按 Trade.ID 去重（只有完全相同的重复成交回报被忽略）-> 账本入账 ->
+// 档位代号轮换 -> 重新生成意图并对账 -> 持久化。
+// 序号水位不用于拒绝成交：新成交回报无论其序号相对水位新旧都必须生效一次，
+// 因此同一组成交以任意顺序注入，最终持仓都等于按该组成交集合重算的结果。
 func (e *Engine) handleTrade(ctx context.Context, ev *TradeEvent) (bool, error) {
 	tr := ev.Trade
 	if e.ledger.Has(tr.ID) {
-		return true, nil
-	}
-	// 乱序容错：序号水位只接受更新的回报。
-	// 注意 ID 去重先于序号判断，因此"迟到的重复回报"在任何序号下都被忽略。
-	if tr.Seq <= e.lastTradeSeq {
 		return true, nil
 	}
 
@@ -122,7 +119,11 @@ func (e *Engine) handleTrade(ctx context.Context, ev *TradeEvent) (bool, error) 
 	if !applied {
 		return true, nil
 	}
-	e.lastTradeSeq = tr.Seq
+	// 推进序号水位（取最大值），仅用于崩溃恢复后对齐网关成交自增序号，
+	// 不用于拒绝成交。
+	if tr.Seq > e.lastTradeSeq {
+		e.lastTradeSeq = tr.Seq
+	}
 
 	// 轮换被成交档位的代号，使重新挂单使用全新 ClientOrderID。
 	if _, side, level, _, perr := pricing.ParseClientOrderID(tr.MakerOrderID); perr == nil {

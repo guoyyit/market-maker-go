@@ -43,11 +43,27 @@ func TestValidateRejectsBadFields(t *testing.T) {
 		"zero timeout":     func(c Config) Config { c.HeartbeatTimeout = 0; return c },
 		"zero price jump":  func(c Config) Config { c.MaxPriceJump = 0; return c },
 		"negative jitter":  func(c Config) Config { c.JitterTicks = -1; return c },
+		"negative qty skew coeff": func(c Config) Config { c.QtySkewCoeff = -1; return c },
+		"qty skew coeff>0 with zero denom": func(c Config) Config {
+			c.QtySkewCoeff = 3
+			c.QtySkewDenom = 0
+			return c
+		},
 	}
 	for name, mutate := range cases {
 		if err := mutate(validCfg()).Validate(); err == nil {
 			t.Errorf("case %s: expected validation error", name)
 		}
+	}
+}
+
+func TestValidateAcceptsZeroQtySkewCoeffWithZeroDenom(t *testing.T) {
+	// 系数为 0（旧配置零值）时分母允许为 0，无需迁移即可继续使用。
+	cfg := validCfg()
+	cfg.QtySkewCoeff = 0
+	cfg.QtySkewDenom = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero coeff with zero denom should be valid: %v", err)
 	}
 }
 

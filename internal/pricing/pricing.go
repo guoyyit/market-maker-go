@@ -14,6 +14,12 @@
 //     GEN 加 1 后重新挂单，因为网关规定终态（已成交）ID 不得复用；
 //   - 触及持仓上限时，停止会继续增加该方向敞口的报价
 //     （持仓 >= +MaxPosition 时不再挂买单；<= -MaxPosition 时不再挂卖单）。
+//   - 数量倾斜（QtySkewCoeff > 0 时生效，与价格倾斜相互独立、同时生效）：
+//     deviation = position - InventoryTarget，
+//     qtyShift = QtySkewCoeff * trunc(|deviation| / QtySkewDenom)（向 0 取整），
+//     持仓高于目标时买侧每档数量 = BaseQty - qtyShift、卖侧 = BaseQty + qtyShift，
+//     低于目标时方向相反；某侧数量 <= 0 时该侧停止挂单（已有报价随对账撤掉），
+//     数量回升到正数后自动恢复。
 package pricing
 
 import (
@@ -168,12 +174,46 @@ func (g *Generator) skewShift(position int64) int64 {
 	return -(g.cfg.SkewCoeff * (neg / g.cfg.SkewDenom))
 }
 
+// qtyShift 返回数量倾斜的调整幅度（非负）：
+// 相对目标每偏离 QtySkewDenom 个数量单位，同向一侧每档数量减少
+// QtySkewCoeff 个单位、反向一侧增加相同数量。
+// 整除向 0 截断，调整幅度恒为 QtySkewCoeff 的整数倍，确定可复现。
+// 系数为 0 时返回 0（保持 BaseQty 不变，旧配置行为）。
+func (g *Generator) qtyShift(deviation int64) int64 {
+	if g.cfg.QtySkewCoeff == 0 {
+		return 0
+	}
+	d := deviation
+	if d < 0 {
+		d = -d
+	}
+	return g.cfg.QtySkewCoeff * (d / g.cfg.QtySkewDenom)
+}
+
 // Generate 生成一帧两侧报价。
 // position 为当前持仓；返回的报价集合即为该帧的完整报价意图。
 // 返回切片按 (买档 0..N, 卖档 0..N) 固定顺序排列，保证确定性。
 func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 	shift := g.skewShift(position)
 	fairMid := tick.Mid() - shift
+
+	// 数量倾斜：与价格倾斜独立计算、同时生效，互不覆盖。
+	// deviation > 0（持仓高于目标）：买侧递减、卖侧递增；
+	// deviation < 0：方向相反。
+	deviation := position - g.cfg.InventoryTarget
+	qShift := g.qtyShift(deviation)
+	var buyQty, sellQty int64
+	switch {
+	case deviation > 0:
+		buyQty = g.cfg.BaseQty - qShift
+		sellQty = g.cfg.BaseQty + qShift
+	case deviation < 0:
+		buyQty = g.cfg.BaseQty + qShift
+		sellQty = g.cfg.BaseQty - qShift
+	default:
+		buyQty = g.cfg.BaseQty
+		sellQty = g.cfg.BaseQty
+	}
 
 	// 整帧买卖两侧共享同一个抖动值；同一 tick 帧（Seq 相同）复用缓存值，
 	// 只有真正的新行情帧才从 RNG 抽取，抖动只影响价位水平、不改变两侧价差。
@@ -190,9 +230,12 @@ func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 		}
 	}
 
-	// 库存上限：停止会继续增加同方向敞口的一侧报价。
-	canBuy := position < g.cfg.MaxPosition
-	canSell := position > -g.cfg.MaxPosition
+	// 库存上限与数量倾斜共同决定一侧是否报价：
+	//   - 未达上限时数量随偏离递减，达到上限后同向敞口一侧完全停止报价；
+	//   - 倾斜后数量 <= 0 的一侧也停止报价（已有报价随对账撤掉），
+	//     数量回升到正数后下一次报价自动恢复。
+	canBuy := position < g.cfg.MaxPosition && buyQty > 0
+	canSell := position > -g.cfg.MaxPosition && sellQty > 0
 
 	quotes := make([]types.Quote, 0, 2*g.cfg.Levels)
 	appendSide := func(side types.Side, can bool, sign int64) {
@@ -206,7 +249,7 @@ func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 				Side:          side,
 				Level:         level,
 				Price:         fairMid + sign*offset + jitter,
-				Qty:           g.cfg.BaseQty,
+				Qty:           sideQty(side, buyQty, sellQty),
 				ClientOrderID: g.orderID(side, level),
 			})
 		}
@@ -214,6 +257,14 @@ func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 	appendSide(types.SideBuy, canBuy, -1)
 	appendSide(types.SideSell, canSell, +1)
 	return quotes
+}
+
+// sideQty 返回指定侧别的每档挂单数量。
+func sideQty(side types.Side, buyQty, sellQty int64) int64 {
+	if side == types.SideBuy {
+		return buyQty
+	}
+	return sellQty
 }
 
 // ClientOrderID 返回某标的某侧某档某代号的确定性订单标识。
