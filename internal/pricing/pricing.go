@@ -9,11 +9,18 @@
 //     卖价 = fairMid + HalfSpread + l*LevelStep + jitter；
 //   - jitter 为 [-JitterTicks, JitterTicks] 内由固定种子 RNG 逐帧确定性产生，
 //     同一帧买卖两侧共享同一个抖动值，抖动不平滑价差；
+//   - 数量倾斜（与价格倾斜同时生效，互不覆盖）：
+//     deviation = position - InventoryTarget
+//     adj = deviation * QtySkewCoeff / 1000（全程整数运算，向 0 截断）
+//     bidQty = BaseQty - adj，askQty = BaseQty + adj
+//     某侧数量 <= 0 时该侧不产生任何档位（停止挂单），数量回升为正后自动恢复；
 //   - ClientOrderID = "SYMBOL-SIDE-LEVEL-GEN" 确定性生成；同一档位未成交时
 //     GEN 保持不变，行情变化只产生价格层面的增量撤改；一旦该档被成交，
 //     GEN 加 1 后重新挂单，因为网关规定终态（已成交）ID 不得复用；
 //   - 触及持仓上限时，停止会继续增加该方向敞口的报价
 //     （持仓 >= +MaxPosition 时不再挂买单；<= -MaxPosition 时不再挂卖单）。
+//     上限是硬性裁剪，与数量倾斜的组合：未达上限时数量随偏离递减/递增，
+//     一旦触及上限，同向敞口一侧一律完全停止（即使倾斜数量仍为正）。
 package pricing
 
 import (
@@ -25,6 +32,10 @@ import (
 	"github.com/guoyyit/market-maker-go/internal/config"
 	"github.com/guoyyit/market-maker-go/internal/types"
 )
+
+// qtySkewScale 是数量倾斜系数的固定千分位分母：
+// QtySkewCoeff=1 表示每偏离目标 1000 个数量单位，每档数量调整 1。
+const qtySkewScale int64 = 1000
 
 // Generator 根据行情与持仓生成报价意图。
 type Generator struct {
@@ -168,12 +179,27 @@ func (g *Generator) skewShift(position int64) int64 {
 	return -(g.cfg.SkewCoeff * (neg / g.cfg.SkewDenom))
 }
 
+// qtyAdjustment 返回给定持仓相对目标的每档数量调整量：
+// 正值表示"买减卖加"（持仓高于目标），负持仓下结果为负、方向自然相反。
+//
+// 全程整数运算，不引入浮点：先乘后除，整除向 0 截断，正负偏离语义对称。
+// QtySkewCoeff 为千分位系数（0 关闭数量倾斜），故除以固定 1000。
+func (g *Generator) qtyAdjustment(position int64) int64 {
+	if g.cfg.QtySkewCoeff == 0 {
+		return 0
+	}
+	deviation := position - g.cfg.InventoryTarget
+	return deviation * g.cfg.QtySkewCoeff / qtySkewScale
+}
+
 // Generate 生成一帧两侧报价。
 // position 为当前持仓；返回的报价集合即为该帧的完整报价意图。
 // 返回切片按 (买档 0..N, 卖档 0..N) 固定顺序排列，保证确定性。
 func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 	shift := g.skewShift(position)
 	fairMid := tick.Mid() - shift
+	// 数量倾斜与价格倾斜相互独立：adj 只影响数量，shift 只影响价格。
+	adj := g.qtyAdjustment(position)
 
 	// 整帧买卖两侧共享同一个抖动值；同一 tick 帧（Seq 相同）复用缓存值，
 	// 只有真正的新行情帧才从 RNG 抽取，抖动只影响价位水平、不改变两侧价差。
@@ -195,8 +221,14 @@ func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 	canSell := position > -g.cfg.MaxPosition
 
 	quotes := make([]types.Quote, 0, 2*g.cfg.Levels)
-	appendSide := func(side types.Side, can bool, sign int64) {
+	// qtySign=−1 为买侧（qty=BaseQty−adj），+1 为卖侧（qty=BaseQty+adj）。
+	appendSide := func(side types.Side, can bool, priceSign, qtySign int64) {
 		if !can {
+			return
+		}
+		qty := g.cfg.BaseQty + qtySign*adj
+		// 倾斜后数量降为 0 或以下：该侧停止挂单；回升为正后下次生成自动恢复。
+		if qty <= 0 {
 			return
 		}
 		for level := 0; level < g.cfg.Levels; level++ {
@@ -205,14 +237,14 @@ func (g *Generator) Generate(tick types.Tick, position int64) []types.Quote {
 				Symbol:        g.cfg.Symbol,
 				Side:          side,
 				Level:         level,
-				Price:         fairMid + sign*offset + jitter,
-				Qty:           g.cfg.BaseQty,
+				Price:         fairMid + priceSign*offset + jitter,
+				Qty:           qty,
 				ClientOrderID: g.orderID(side, level),
 			})
 		}
 	}
-	appendSide(types.SideBuy, canBuy, -1)
-	appendSide(types.SideSell, canSell, +1)
+	appendSide(types.SideBuy, canBuy, -1, -1)
+	appendSide(types.SideSell, canSell, +1, +1)
 	return quotes
 }
 

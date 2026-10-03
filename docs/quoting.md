@@ -16,10 +16,11 @@
 `Levels`（每侧档位数），对档位 `l = 0 .. Levels-1`：
 
 ```
-fairMid = Mid - skewShift
-offset  = HalfSpread + l * LevelStep
-bid[l]  = fairMid - offset + jitter
-ask[l]  = fairMid + offset + jitter
+deviation = position - InventoryTarget
+fairMid   = Mid - skewShift（价格倾斜）
+offset    = HalfSpread + l * LevelStep
+bid[l]    = fairMid - offset + jitter，数量 bidQty
+ask[l]    = fairMid + offset + jitter，数量 askQty
 ```
 
 返回顺序固定为「买侧档位 0..N-1，随后卖侧档位 0..N-1」。
@@ -36,12 +37,51 @@ skewShift = SkewCoeff * trunc(deviation / SkewDenom)
   使卖出更容易被成交、买入更难，引导库存回落。
 - 持仓低于目标时对称地上移。
 
+## 数量倾斜
+
+由 `QtySkewCoeff`（**千分位**非负整数，0 表示关闭）控制，与价格倾斜
+**同时生效、互不覆盖**：一个只改价格，一个只改数量。
+
+```
+deviation = position - InventoryTarget
+adj       = deviation * QtySkewCoeff / 1000
+bidQty    = BaseQty - adj
+askQty    = BaseQty + adj
+```
+
+- **全程整数运算，无浮点**：先乘后除，除法按 Go 整数除法**向 0 截断**，
+  正、负偏离语义对称。例如 `BaseQty=10, QtySkewCoeff=100`：
+  - 偏离 `+10`：`adj=1`，买量 `9`、卖量 `11`；
+  - 偏离 `+4`：`adj=0`（截断），两侧仍为 `10`；
+  - 偏离 `-10`：方向相反，买量 `11`、卖量 `9`。
+- 同一侧**每个档位数量相同**（数量不随档位变化）。
+- `QtySkewCoeff = 0` 时 `adj` 恒为 0，两侧数量恒为 `BaseQty`，
+  即旧行为；旧配置零值无需迁移。
+
+### 数量归零：停止挂单与自动恢复
+
+- 倾斜后某侧数量 `<= 0` 时，该侧**不产生任何档位**，并通过增量对账
+  **撤掉该侧已有全部报价**（卖侧或买侧整体空盘）。
+- 持仓回落到使该侧数量重新为**正**后，下一次报价自动恢复该侧挂单。
+- 例：`BaseQty=10, QtySkewCoeff=100`，偏离 `+100` 时 `adj=10`，
+  买量 `0`，买侧完全停止；偏离回落到 `+90` 时买量 `1`，买侧恢复。
+
 ## 仓位上限
 
 - `position >= +MaxPosition`：**停止挂买单**，只保留卖侧报价，
   不再增加多头敞口。
 - `position <= -MaxPosition`：**停止挂卖单**，只保留买侧报价。
 - 回落到上限以内后，下一次报价自动恢复缺失的一侧。
+
+### 与数量倾斜的组合语义
+
+两道裁剪**串联**，顺序固定：
+
+1. 先按数量倾斜计算两侧数量：未达上限时数量随偏离程度递减/递增；
+2. 再套用仓位上限这一**硬性裁剪**：只要 `position >= +MaxPosition`，
+   买侧一律完全停止，即使按数量倾斜买量仍为正；负上限对卖侧同理。
+
+即"未达上限时数量随偏离递减，达到上限后同向敞口一侧完全停止报价"。
 
 ## 确定性抖动
 

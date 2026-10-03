@@ -60,7 +60,9 @@ type State struct {
 	// Pricer 报价生成器状态（档位代号与 RNG 计数）。
 	Pricer pricing.State `json:"pricer"`
 
-	// LastTickSeq / LastTradeSeq 已处理输入的最大序号，用于乱序/重复过滤。
+	// LastTickSeq 为已处理行情最大序号（旧行情据此忽略）；
+	// LastTradeSeq 为已见成交最大序号（仅用于重启后播种网关成交序号，
+	// 成交本身只按 ID 去重，不按序号丢弃）。
 	LastTickSeq  uint64 `json:"last_tick_seq"`
 	LastTradeSeq uint64 `json:"last_trade_seq"`
 }

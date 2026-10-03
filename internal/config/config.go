@@ -45,6 +45,15 @@ type Config struct {
 	SkewCoeff int64
 	SkewDenom int64
 
+	// QtySkewCoeff 数量倾斜系数（千分位，>=0）：
+	// 相对目标每偏离 1 个数量单位，每侧每档数量按系数的千分之一调整：
+	//   adj   = deviation * QtySkewCoeff / 1000（全程整数运算，向 0 截断）
+	//   bidQty = BaseQty - adj，askQty = BaseQty + adj
+	// 持仓高于目标时买侧数量递减、卖侧数量递增；低于目标时方向相反。
+	// 取 0 时两侧数量恒为 BaseQty（旧行为，旧配置零值即兼容，无需迁移）。
+	// 计算结果 <= 0 的一侧停止挂单（详见 pricing 包与 docs/quoting.md）。
+	QtySkewCoeff int64
+
 	// HeartbeatTimeout 行情心跳超时阈值：距最近一帧行情超过该时长则撤单保护。
 	HeartbeatTimeout time.Duration
 
@@ -87,6 +96,9 @@ func (c Config) Validate() error {
 	}
 	if c.SkewCoeff < 0 {
 		return errors.New("config: skew coeff must be >= 0")
+	}
+	if c.QtySkewCoeff < 0 {
+		return errors.New("config: qty skew coeff must be >= 0")
 	}
 	if c.HeartbeatTimeout <= 0 {
 		return errors.New("config: heartbeat timeout must be > 0")

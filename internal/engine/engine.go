@@ -69,7 +69,9 @@ type Engine struct {
 	in  chan Event
 	out chan Observation
 
-	// 序号水位：旧序号输入不覆盖新状态。
+	// 序号水位：行情侧旧序号输入不覆盖新状态；
+	// 成交侧水位仅记录已见最大序号，用于崩溃恢复后播种网关成交序号，
+	// 不用于丢弃回报——成交只按 ID 去重，乱序到达同样生效。
 	lastTickSeq  uint64
 	lastTradeSeq uint64
 

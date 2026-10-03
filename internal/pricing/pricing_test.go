@@ -107,6 +107,154 @@ func TestPositionCapCutsExposureSide(t *testing.T) {
 	}
 }
 
+func qtyByLevel(quotes []types.Quote, side types.Side) map[int]int64 {
+	out := map[int]int64{}
+	for _, q := range quotes {
+		if q.Side == side {
+			out[q.Level] = q.Qty
+		}
+	}
+	return out
+}
+
+func TestQtySkewAdjustsBothSidesSymmetrically(t *testing.T) {
+	cfg := testCfg() // BaseQty=7
+	cfg.QtySkewCoeff = 100
+	g := NewGenerator(cfg)
+
+	// 偏离 +10：adj = 10*100/1000 = 1（整除向 0 截断）。
+	// 买侧 7-1=6 递减，卖侧 7+1=8 递增；价格倾斜同时生效（与数量互不覆盖）。
+	quotes := g.Generate(tick100(1), 10)
+	buys, sells := qtyByLevel(quotes, types.SideBuy), qtyByLevel(quotes, types.SideSell)
+	if len(buys) != 2 || len(sells) != 2 {
+		t.Fatalf("side quote counts: buy=%d sell=%d, want 2/2", len(buys), len(sells))
+	}
+	for level := 0; level < 2; level++ {
+		if buys[level] != 6 || sells[level] != 8 {
+			t.Fatalf("level %d qty buy=%d sell=%d, want 6/8", level, buys[level], sells[level])
+		}
+	}
+	if quotes[0].Price != 97 || quotes[2].Price != 101 {
+		t.Fatalf("prices must still skew independently: buy0=%d sell0=%d",
+			quotes[0].Price, quotes[2].Price)
+	}
+
+	// 偏离 -10：方向相反，买 8 卖 6。
+	quotes = g.Generate(tick100(2), -10)
+	buys, sells = qtyByLevel(quotes, types.SideBuy), qtyByLevel(quotes, types.SideSell)
+	for level := 0; level < 2; level++ {
+		if buys[level] != 8 || sells[level] != 6 {
+			t.Fatalf("negative deviation level %d: buy=%d sell=%d, want 8/6",
+				level, buys[level], sells[level])
+		}
+	}
+
+	// 整除向 0 截断：偏离 ±4 时 adj=0，两侧仍为基础数量。
+	quotes = g.Generate(tick100(3), 4)
+	buys, sells = qtyByLevel(quotes, types.SideBuy), qtyByLevel(quotes, types.SideSell)
+	for level := 0; level < 2; level++ {
+		if buys[level] != 7 || sells[level] != 7 {
+			t.Fatalf("truncated deviation level %d: buy=%d sell=%d, want 7/7",
+				level, buys[level], sells[level])
+		}
+	}
+}
+
+func TestQtySkewZeroCoeffKeepsBaseQty(t *testing.T) {
+	cfg := testCfg()
+	cfg.QtySkewCoeff = 0
+	g := NewGenerator(cfg)
+	quotes := g.Generate(tick100(1), 9999)
+	for _, q := range quotes {
+		if q.Qty != 7 {
+			t.Fatalf("qty = %d, want base 7 with skew disabled", q.Qty)
+		}
+	}
+}
+
+func TestQtySkewNonPositiveSideStopsAndRecovers(t *testing.T) {
+	cfg := testCfg() // BaseQty=7，上限足够大，本用例只由数量倾斜触发停挂。
+	cfg.MaxPosition = 1_000
+	cfg.QtySkewCoeff = 100
+	g := NewGenerator(cfg)
+
+	// 偏离 +70：买侧 adj=7 -> 买量 0，买侧停止挂单，只剩卖侧。
+	quotes := g.Generate(tick100(1), 70)
+	if buys := qtyByLevel(quotes, types.SideBuy); len(buys) != 0 {
+		t.Fatalf("buy side must stop at non-positive qty, got %d quotes", len(buys))
+	}
+	if sells := qtyByLevel(quotes, types.SideSell); len(sells) != 2 {
+		t.Fatalf("sell side must remain, got %d quotes", len(sells))
+	}
+
+	// 偏离回落：买侧数量恢复为正，自动重新挂出。
+	quotes = g.Generate(tick100(2), 10)
+	if buys := qtyByLevel(quotes, types.SideBuy); len(buys) != 2 || buys[0] != 6 {
+		t.Fatalf("buy side must recover, got %+v", buys)
+	}
+
+	// 负偏离下对称：卖侧归零停止，买侧保留。
+	quotes = g.Generate(tick100(3), -70)
+	if sells := qtyByLevel(quotes, types.SideSell); len(sells) != 0 {
+		t.Fatalf("sell side must stop at -deviation, got %d quotes", len(sells))
+	}
+	if buys := qtyByLevel(quotes, types.SideBuy); len(buys) != 2 {
+		t.Fatalf("buy side must remain at -deviation, got %d quotes", len(buys))
+	}
+}
+
+func TestQtySkewCombinedWithPositionCap(t *testing.T) {
+	cfg := testCfg() // BaseQty=7，MaxPosition=20
+	cfg.MaxPosition = 20
+	cfg.QtySkewCoeff = 100
+	g := NewGenerator(cfg)
+
+	// 未达上限（偏离 +10）：数量随偏离调整，两侧都在挂。
+	quotes := g.Generate(tick100(1), 10)
+	if len(quotes) != 4 {
+		t.Fatalf("below cap: quotes=%d, want 4", len(quotes))
+	}
+
+	// 达到上限（持仓 20）：即使按系数买量仍为正（7-2=5），
+	// 同向敞口一侧（买侧）也必须完全停止，只保留卖侧。
+	quotes = g.Generate(tick100(2), 20)
+	if len(quotes) != 2 {
+		t.Fatalf("at cap: quotes=%d, want 2 sell-only", len(quotes))
+	}
+	for _, q := range quotes {
+		if q.Side != types.SideSell {
+			t.Fatalf("at +cap quote side=%v, want SELL", q.Side)
+		}
+	}
+}
+
+func TestQtySkewHotUpdateAppliesWithoutResettingRNG(t *testing.T) {
+	cfg := testCfg()
+	g := NewGenerator(cfg)
+	before := g.Generate(tick100(1), 10)
+	if before[0].Qty != 7 {
+		t.Fatalf("initial qty = %d, want 7", before[0].Qty)
+	}
+
+	// 热更新打开数量倾斜：立即生效。
+	cfg.QtySkewCoeff = 100
+	g.SetConfig(cfg)
+	after := g.Generate(tick100(2), 10)
+	if after[0].Qty != 6 || after[2].Qty != 8 {
+		t.Fatalf("after hot update qty buy0=%d sell0=%d, want 6/8",
+			after[0].Qty, after[2].Qty)
+	}
+
+	// 热更新系数归零：恢复旧行为（两侧恒为基础数量）。
+	cfg.QtySkewCoeff = 0
+	g.SetConfig(cfg)
+	again := g.Generate(tick100(3), 10)
+	if again[0].Qty != 7 || again[2].Qty != 7 {
+		t.Fatalf("after coeff reset qty buy0=%d sell0=%d, want 7/7",
+			again[0].Qty, again[2].Qty)
+	}
+}
+
 func TestGenerationAdvancesAfterFill(t *testing.T) {
 	g := NewGenerator(testCfg())
 	quotes := g.Generate(tick100(1), 0)

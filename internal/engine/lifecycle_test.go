@@ -115,7 +115,7 @@ func TestStaleAndDuplicateTicksDoNotOverwrite(t *testing.T) {
 	}
 }
 
-func TestDuplicateAndStaleTradesDoNotDoubleCount(t *testing.T) {
+func TestDuplicateTradesIgnoredButOutOfOrderTradesApply(t *testing.T) {
 	h := newHarness(t, testConfig())
 	defer h.stop()
 	base := time.Unix(1_000_000, 0)
@@ -144,17 +144,33 @@ func TestDuplicateAndStaleTradesDoNotDoubleCount(t *testing.T) {
 		t.Fatalf("duplicate trade: skipped=%v pos=%d", obs.Skipped, obs.Position)
 	}
 
-	// 新 ID 但序号回退（迟到）：也不得入账。
-	stale := trade
-	stale.ID = "F-OLD"
-	stale.Seq = 0
+	// 新 ID 但序号回退（迟到的旧序号回报）：必须照常生效一次。
+	// 成交结果只由成交集合决定，与到达顺序无关。
+	sell0ID := pricing.ClientOrderID(testSymbol, types.SideSell, 0, 0)
+	stale := types.Trade{
+		ID:           "F-OLD",
+		Symbol:       testSymbol,
+		MakerOrderID: sell0ID,
+		MakerSide:    types.SideSell,
+		Price:        102,
+		Qty:          4,
+		Seq:          0,
+		Time:         base.Add(6 * time.Millisecond),
+	}
 	obs = h.send(Event{Trade: &TradeEvent{Trade: stale}})
-	if !obs.Skipped || obs.Position != 10 {
-		t.Fatalf("stale-seq trade: skipped=%v pos=%d", obs.Skipped, obs.Position)
+	if obs.Skipped || obs.Position != 6 {
+		t.Fatalf("out-of-order trade must apply once: skipped=%v pos=%d",
+			obs.Skipped, obs.Position)
 	}
 
-	if h.eng.ledgerSnapshotCount() != 1 {
-		t.Fatalf("applied trade count = %d, want 1", h.eng.ledgerSnapshotCount())
+	// 迟到成交生效后再次注入同一回报：作为完全重复被忽略，不二次影响持仓。
+	obs = h.send(Event{Trade: &TradeEvent{Trade: stale}})
+	if !obs.Skipped || obs.Position != 6 {
+		t.Fatalf("duplicate of late trade: skipped=%v pos=%d", obs.Skipped, obs.Position)
+	}
+
+	if h.eng.ledgerSnapshotCount() != 2 {
+		t.Fatalf("applied trade count = %d, want 2", h.eng.ledgerSnapshotCount())
 	}
 
 	// 成交档位代号轮换：该档新挂单必须使用 GEN=1 的新 ID，

@@ -40,9 +40,13 @@ func TestValidateRejectsBadFields(t *testing.T) {
 		"wide half spread": func(c Config) Config { c.HalfSpread = 100; return c },
 		"negative max pos": func(c Config) Config { c.MaxPosition = -1; return c },
 		"zero skew denom":  func(c Config) Config { c.SkewDenom = 0; return c },
-		"zero timeout":     func(c Config) Config { c.HeartbeatTimeout = 0; return c },
-		"zero price jump":  func(c Config) Config { c.MaxPriceJump = 0; return c },
-		"negative jitter":  func(c Config) Config { c.JitterTicks = -1; return c },
+		"negative qty skew": func(c Config) Config {
+			c.QtySkewCoeff = -1
+			return c
+		},
+		"zero timeout":    func(c Config) Config { c.HeartbeatTimeout = 0; return c },
+		"zero price jump": func(c Config) Config { c.MaxPriceJump = 0; return c },
+		"negative jitter": func(c Config) Config { c.JitterTicks = -1; return c },
 	}
 	for name, mutate := range cases {
 		if err := mutate(validCfg()).Validate(); err == nil {
